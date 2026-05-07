@@ -1,0 +1,10 @@
+# 敏感配置（含 API key）
+config.json
+
+# 中间文件（自动生成）
+project_reports/_merge_*.json
+project_reports/_prompt_*.txt
+
+# Python
+__pycache__/
+*.pyc

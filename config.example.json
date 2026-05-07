@@ -1,0 +1,54 @@
+{
+  "project_name": "FULLMASK平台项目",
+  "api": {
+    "key": "sk-你的DeepSeek-key",
+    "base": "https://api.deepseek.com",
+    "model": "deepseek-chat"
+  },
+  "people": [
+    {"name": "成员A", "file": "individual_reports/成员A.txt"},
+    {"name": "成员B", "file": "individual_reports/成员B.txt"},
+    {"name": "成员C", "file": "individual_reports/成员C.txt"},
+    {"name": "成员D", "file": "individual_reports/成员D.txt"}
+  ],
+  "project_report_dir": "project_reports",
+  "project_report_pattern": "小组周报_{week_label}.md",
+  "sections": [
+    {
+      "id": "1",
+      "title": "FULLMASK平台打通及支持",
+      "aliases": ["FULLMASK", "fullmask", "平台打通", "行标自同步", "校准综测", "低功耗", "定位功能", "信标同步", "3GPP-SLSS", "SLSS同步", "外场测试", "外场"],
+      "subsections": [
+        {"id": "1.1", "title": "行标自同步验证", "aliases": ["行标自同步", "SLSS同步UTC", "行标SLSS"]},
+        {"id": "1.2", "title": "校准综测版本维护", "aliases": ["校准综测", "综测", "校准", "频谱辐射", "邻道泄露"]},
+        {"id": "1.3", "title": "低功耗功能开发及验证", "aliases": ["低功耗", "子帧保持", "睡眠", "功耗"]},
+        {"id": "1.4", "title": "定位功能开发及验证", "aliases": ["定位", "定位功能", "加速器", "定位流程"]},
+        {"id": "1.5", "title": "信标同步方案验证", "aliases": ["信标同步", "信标"]},
+        {"id": "1.6", "title": "3GPP-slss同步方案验证", "aliases": ["3GPP", "SLSS", "slss", "3GPP-SLSS", "3GPP-slss", "AP消息", "任务激活"]}
+      ]
+    },
+    {
+      "id": "2",
+      "title": "支持工作",
+      "aliases": ["支持工作", "系统集成", "集成测试", "外部版本", "外部问题", "版本维护"],
+      "subsections": [
+        {"id": "2.1", "title": "FULLMASK系统集成版本迭代", "aliases": ["系统集成版本迭代", "版本迭代", "版本发布", "功耗优化", "测试模式"]},
+        {"id": "2.2", "title": "FULLMASK系统集成测试支持", "aliases": ["集成测试", "带外阻塞", "HPF", "DCO", "灵敏度"]},
+        {"id": "2.3", "title": "外部版本维护", "aliases": ["外部版本", "SLT版本", "PTC版本", "HARQ"]},
+        {"id": "2.4", "title": "外部问题定位及支持", "aliases": ["外部问题", "星云发包", "丢包率", "PDU", "RLC", "设备跑死"]}
+      ]
+    },
+    {
+      "id": "3",
+      "title": "项目及资源工作",
+      "aliases": ["项目资源", "项目管理", "资源"],
+      "subsections": []
+    },
+    {
+      "id": "4",
+      "title": "其他",
+      "aliases": ["其他", "性能测试工具", "无人机", "自组网", "传输参数自适应", "RSRP", "Kalman", "滤波"],
+      "subsections": []
+    }
+  ]
+}
