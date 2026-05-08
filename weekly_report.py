@@ -307,6 +307,62 @@ def read_previous_report(config: dict, week_label: str) -> str | None:
     return None
 
 
+# ─── 完成标记扫描 ──────────────────────────────────────────
+
+def scan_completion_markers(report_text: str, markers: list[str]) -> list[dict]:
+    """扫描上周周报，找出包含完成标记的行。
+    返回 [{line_num, line_text, marker, section}, ...]"""
+    if not report_text:
+        return []
+    lines = report_text.split("\n")
+    matches = []
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        for marker in markers:
+            if marker in stripped:
+                # 向上查找所属分组
+                section = ""
+                for j in range(i, -1, -1):
+                    if lines[j].strip().startswith("###"):
+                        section = lines[j].strip("# ").strip()
+                        break
+                matches.append({
+                    "line_num": i + 1,
+                    "line_text": stripped,
+                    "marker": marker,
+                    "section": section,
+                })
+                break  # 一行只匹配一个 marker
+
+    return matches
+
+
+def mark_report_for_review(report_text: str, markers: list[str]) -> str:
+    """在包含完成标记的行前添加 [待确认删除] 标记。"""
+    if not report_text:
+        return report_text
+    lines = report_text.split("\n")
+    result = []
+    for line in lines:
+        marked = False
+        for marker in markers:
+            if marker in line:
+                # 匹配 "  1. text" 格式
+                m = re.match(r'^(\s+)(\d+)\.\s', line)
+                if m:
+                    result.append(f"{m.group(1)}**[待确认删除]** {m.group(2)}. {line[m.end():]}")
+                else:
+                    result.append(f"**[待确认删除]** {line}")
+                marked = True
+                break
+        if not marked:
+            result.append(line)
+    return "\n".join(result)
+
+
 # ─── 结构体生成 ──────────────────────────────────────────
 
 def build_structure(prev_report: str | None, all_items: list[dict], people: list[dict],
@@ -490,9 +546,21 @@ def call_deepseek_api(prompt: str, api_key: str, api_base: str = DEFAULT_API_BAS
 
 def output_md(struct: dict, week_label: str, api_key: str,
               api_base: str = DEFAULT_API_BASE, model: str = DEFAULT_MODEL,
-              save_prompt: bool = False):
+              save_prompt: bool = False, completion_markers: list[str] | None = None):
     """调用 LLM 生成本周项目周报 .md 文件。"""
     prompt = build_prompt_text(struct)
+
+    # 扫描上周报告中的已完成条目，追加到 prompt
+    if completion_markers and struct.get("previous_report"):
+        matches = scan_completion_markers(struct["previous_report"], completion_markers)
+        if matches:
+            lines = ["\n---\n", "## ⚠ 上周周报已完成条目识别\n"]
+            lines.append("以下条目在上周报告中标记为已完成，请在新周报中酌情删除或标记为「已完成归档」（勿保留原文）：\n")
+            for m in matches:
+                lines.append(f"- [{m['section']}] {m['line_text'][:80]}")
+            lines.append(f"\n共 {len(matches)} 条待处理。")
+            prompt += "\n".join(lines)
+            print(f"🔍 上周报告中识别到 {len(matches)} 条已完成条目，已写入 prompt。")
 
     if save_prompt:
         prompt_path = f"project_reports/_prompt_{week_label}.txt"
@@ -523,6 +591,8 @@ def main():
     parser.add_argument("--model", default=DEFAULT_MODEL, help="模型名称")
     parser.add_argument("--save-prompt", action="store_true",
                         help="生成 md 时同时保存 prompt 文件")
+    parser.add_argument("--review", action="store_true",
+                        help="扫描上周周报中的已完成条目，标记并生成 _review.md 供审核")
     args = parser.parse_args()
 
     # 确定周标签
@@ -566,6 +636,33 @@ def main():
     # 读取上周项目周报
     prev_report = read_previous_report(config, week_label)
 
+    # --review 模式：扫描已完成条目
+    markers = config.get("completion_markers", [])
+    if args.review:
+        if prev_report and markers:
+            matches = scan_completion_markers(prev_report, markers)
+            if matches:
+                print(f"\n{'='*60}")
+                print(f"🔍 上周周报已完成条目扫描 — 共 {len(matches)} 处匹配")
+                print(f"{'='*60}")
+                for m in matches:
+                    ctx = m["line_text"][:70]
+                    print(f"  L{m['line_num']:3d}  [{m['marker']}]  {m['section'][:35]}")
+                    print(f"         {ctx}")
+                # 保存标记版
+                marked = mark_report_for_review(prev_report, markers)
+                prev_label = prev_week_label(week_label)
+                review_path = f"project_reports/小组周报_{prev_label}_review.md"
+                with open(review_path, "w", encoding="utf-8") as f:
+                    f.write(marked)
+                print(f"\n📝 标记版已保存: {review_path}")
+                print(f"   请打开该文件确认，删除已完成条目后重新运行脚本。")
+            else:
+                print("✅ 未发现明显已完成条目。")
+        else:
+            print("⚠ 无上周周报或未配置 completion_markers，跳过扫描。")
+        return
+
     # 构建结构化数据
     struct = build_structure(prev_report, all_items, config["people"],
                              config["sections"], week_label)
@@ -591,7 +688,8 @@ def main():
             print("   - 命令行参数: --api-key sk-xxx")
             sys.exit(1)
         output_md(struct, week_label, api_key, api_base, api_model,
-                  save_prompt=args.save_prompt)
+                  save_prompt=args.save_prompt,
+                  completion_markers=config.get("completion_markers", []))
 
     if args.output not in ("md", "all"):
         print(f"\n📋 下一步:")
