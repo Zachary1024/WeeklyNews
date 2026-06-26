@@ -17,6 +17,9 @@
   python weekly_report.py --output md        # 直接调用 DeepSeek API 生成 .md 周报
   python weekly_report.py --output all       # 输出 JSON + prompt + .md
   python weekly_report.py --output md --save-prompt  # 生成 .md 同时保存 prompt
+  python weekly_report.py --review           # 扫描上周周报已完成条目，生成审核文件
+  python weekly_report.py --diff             # 对比本周与上周周报，列出未变更条目
+  python weekly_report.py --prune ID1,ID2    # 删除指定条目，自动清理空节并重新编号
 """
 
 import json
@@ -59,6 +62,202 @@ def prev_week_label(label: str) -> str:
     # 用该周周四推算该周日期，再减7天
     d = date.fromisocalendar(year, week, 4)
     return get_week_label(d - timedelta(days=7))
+
+
+def get_report_path(config: dict, week_label: str) -> str:
+    """根据配置和周标签，返回项目周报文件路径"""
+    pattern = config["project_report_pattern"].replace("{week_label}", week_label)
+    return os.path.join(config["project_report_dir"], pattern)
+
+
+# ─── 周报结构解析与重构 ────────────────────────────────────
+
+def parse_report_to_structure(text: str) -> list[dict]:
+    """解析周报 Markdown 为结构化数据。
+
+    返回: [{num, title, subsections: [{num, title, items: [{letter, text}]}]}]
+
+    两种格式:
+      - 标题+子条目: （1）标题 下有 - a. / - b. 子条目
+      - 内联条目: （1）条目正文（无子条目，标题即内容）
+    """
+    sections = []
+    section_blocks = re.split(r'\n(?=### \d+\.)', text)
+
+    for block in section_blocks:
+        if not block.strip():
+            continue
+
+        sm = re.match(r'###\s+(\d+)\.\s*(.+)', block)
+        if not sm:
+            continue
+
+        sec_num = int(sm.group(1))
+        sec_title = sm.group(2).strip()
+        body = block[sm.end():].strip()
+
+        sub_blocks = re.split(r'\n(?=（\d+）)', body) if body else []
+
+        subsections = []
+        for sub_block in sub_blocks:
+            sub_block = sub_block.strip()
+            if not sub_block:
+                continue
+
+            sm = re.match(r'（(\d+)）(.+)', sub_block)
+            if not sm:
+                continue
+
+            sub_num = int(sm.group(1))
+            sub_rest = sm.group(2).strip()
+            sub_body = sub_block[sm.end():].strip()
+
+            item_pattern = re.compile(r'(?:^|\n)\s*(?:-\s*)?([a-z])\.\s+')
+            item_matches = list(item_pattern.finditer(sub_body))
+
+            if item_matches:
+                items = []
+                for j, m in enumerate(item_matches):
+                    letter = m.group(1)
+                    start = m.end()
+                    end = item_matches[j + 1].start() if j + 1 < len(item_matches) else len(sub_body)
+                    item_text = sub_body[start:end].strip()
+                    item_lines = item_text.split('\n')
+                    item_text = ' '.join(l.strip() for l in item_lines if l.strip())
+                    items.append({'letter': letter, 'text': item_text})
+
+                subsections.append({
+                    'num': sub_num,
+                    'title': sub_rest,
+                    'items': items
+                })
+            else:
+                subsections.append({
+                    'num': sub_num,
+                    'title': None,
+                    'items': [{'letter': None, 'text': sub_rest}]
+                })
+
+        sections.append({
+            'num': sec_num,
+            'title': sec_title,
+            'subsections': subsections
+        })
+
+    return sections
+
+
+def structure_to_markdown(structure: list[dict]) -> str:
+    """将结构化数据还原为 Markdown 周报。"""
+    lines = []
+
+    for i, sec in enumerate(structure):
+        if i > 0:
+            lines.append('')
+        lines.append(f"### {sec['num']}. {sec['title']}")
+        lines.append('')
+
+        for sub in sec['subsections']:
+            items = sub['items']
+            if not items:
+                continue
+
+            if sub['title'] is not None:
+                lines.append(f"（{sub['num']}）{sub['title']}")
+                lines.append('')
+                for item in items:
+                    lines.append(f"   - {item['letter']}. {item['text']}")
+                    lines.append('')
+            else:
+                for item in items:
+                    lines.append(f"（{sub['num']}）{item['text']}")
+                    lines.append('')
+
+    return '\n'.join(lines)
+
+
+def get_item_map(structure: list[dict]) -> dict[str, str]:
+    """将结构化数据展平为 {item_id: item_text} 映射。"""
+    items = {}
+    for sec in structure:
+        for sub in sec['subsections']:
+            for item in sub['items']:
+                if item['letter']:
+                    item_id = f"{sec['num']}.{sub['num']}.{item['letter']}"
+                else:
+                    item_id = f"{sec['num']}.{sub['num']}"
+                items[item_id] = item['text']
+    return items
+
+
+def _normalize_text(text: str) -> str:
+    """规范化文本用于对比：压缩空白字符。"""
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def diff_report_items(new_struct: list[dict], old_struct: list[dict]) -> list[dict]:
+    """对比新旧周报结构，返回内容未变更的条目列表。
+
+    返回: [{id, text, full_text}, ...]
+    """
+    new_items = get_item_map(new_struct)
+    old_items = get_item_map(old_struct)
+
+    unchanged = []
+    for item_id, new_text in new_items.items():
+        if item_id in old_items:
+            if _normalize_text(new_text) == _normalize_text(old_items[item_id]):
+                preview = new_text[:100] + ('...' if len(new_text) > 100 else '')
+                unchanged.append({
+                    'id': item_id,
+                    'text': preview,
+                    'full_text': new_text
+                })
+
+    return unchanged
+
+
+def prune_report_structure(structure: list[dict], remove_ids: set[str]) -> list[dict]:
+    """从结构中删除指定条目，清理空子节/大节，重新编号。"""
+    for sec in structure:
+        new_subs = []
+        for sub in sec['subsections']:
+            new_items = []
+            for item in sub['items']:
+                if item['letter']:
+                    item_id = f"{sec['num']}.{sub['num']}.{item['letter']}"
+                else:
+                    item_id = f"{sec['num']}.{sub['num']}"
+
+                if item_id not in remove_ids:
+                    new_items.append(item)
+
+            if new_items:
+                sub['items'] = new_items
+                new_subs.append(sub)
+
+        sec['subsections'] = new_subs
+
+    # 移除空大节
+    structure = [s for s in structure if s['subsections']]
+
+    # 重新编号大节
+    for i, sec in enumerate(structure):
+        sec['num'] = i + 1
+
+    # 重新编号子节
+    for sec in structure:
+        for j, sub in enumerate(sec['subsections']):
+            sub['num'] = j + 1
+
+    # 重新编号子条目字母
+    for sec in structure:
+        for sub in sec['subsections']:
+            for k, item in enumerate(sub['items']):
+                if item['letter'] is not None:
+                    item['letter'] = chr(ord('a') + k)
+
+    return structure
 
 
 # ─── 配置加载 ────────────────────────────────────────────
@@ -110,6 +309,222 @@ def read_individual_reports(config: dict) -> dict[str, str]:
     return reports
 
 
+# ─── 个人周报一级标题提取 ─────────────────────────────────
+
+# 一级标题正则：匹配 [可选编号] 标题文本 [可选冒号]
+# 编号格式: "1." "1、" "一、" "（1）" "1)"
+# 为避免误匹配长内容行，加约束：
+#   - 纯标题（无编号、无冒号）限 2-15 字符
+#   - 有编号或有冒号的标题限 2-40 字符
+HEADING_RE_NAMED = re.compile(
+    r'^\s*'
+    r'(?:'
+    r'(?:\d+|[一二三四五六七八九十]+)[\.、．）)]\s*'  # 编号如 "1." "一、"
+    r'|（\d+）\s*'                                       # 中文括号编号 "（1）"
+    r')+'
+    r'([^：:\n]{2,40})'                                   # 有编号的标题（2-40字符）
+    r'[：:]?\s*$'
+)
+
+HEADING_RE_COLON = re.compile(
+    r'^\s*'
+    r'([^：:\n]{2,40})'                                   # 标题文本（2-40字符）
+    r'[：:]\\s*$'                                          # 必须以冒号结尾
+)
+
+HEADING_RE_SHORT = re.compile(
+    r'^\s*'
+    r'([^：:\n]{2,15})'                                   # 短标题（2-15字符，无冒号）
+    r'\s*$'
+)
+
+
+def _is_heading_line(stripped: str) -> str | None:
+    """判断一行是否为一级标题，返回标题文本或 None。
+
+    三级匹配（优先级从高到低）：
+      1. 有编号的标题: "1. Slt bug支持" / "一、外部支持："
+      2. 以冒号结尾的标题: "同步：" / "其他："
+      3. 短标题（2-15字符，无冒号无编号）: "定位支持"
+    """
+    m = HEADING_RE_NAMED.match(stripped)
+    if m:
+        return m.group(1).strip()
+
+    m = HEADING_RE_COLON.match(stripped)
+    if m:
+        return m.group(1).strip()
+
+    m = HEADING_RE_SHORT.match(stripped)
+    if m:
+        return m.group(1).strip()
+
+    return None
+
+
+def extract_headings(text: str) -> list[dict]:
+    """从个人周报文本中提取一级标题及其内容块。
+
+    返回: [{heading: str, lines: [str, ...]}, ...]
+
+    规则：
+      - 用 _is_heading_line() 识别标题行
+      - 短标题（无编号无冒号）只有前面是空行或文件开头时才识别，避免误匹配内容行
+      - 标题后的行属于该标题，直到遇到下一个标题
+      - 第一个标题之前的文本被忽略
+    """
+    raw_lines = text.split('\n')
+    blocks = []
+    current_heading = None
+    current_lines = []
+    prev_blank = True  # 文件开头视为前面有空行
+
+    for line in raw_lines:
+        stripped = line.strip()
+        heading_text = _is_heading_line(stripped)
+
+        # 短标题需要前面有空行
+        if heading_text is not None:
+            is_short = (HEADING_RE_SHORT.match(stripped) is not None
+                        and HEADING_RE_NAMED.match(stripped) is None
+                        and HEADING_RE_COLON.match(stripped) is None)
+            if is_short and not prev_blank:
+                # 短标题但前面没有空行 → 视为内容
+                heading_text = None
+
+        if heading_text is not None:
+            # 保存上一个 block
+            if current_heading is not None:
+                blocks.append({
+                    'heading': current_heading,
+                    'lines': current_lines
+                })
+            current_heading = heading_text
+            current_lines = []
+            prev_blank = False
+        else:
+            if stripped:
+                if current_heading is not None:
+                    current_lines.append(stripped)
+                prev_blank = False
+            else:
+                prev_blank = True
+
+    # 最后一个 block
+    if current_heading is not None:
+        blocks.append({
+            'heading': current_heading,
+            'lines': current_lines
+        })
+
+    return blocks
+
+
+def _tokenize_cjk(text: str) -> list[str]:
+    """从中文文本中提取关键词token（用于匹配）。"""
+    tokens = []
+    # 完整文本作为一个token
+    tokens.append(text)
+    # 按分隔符拆分
+    parts = re.split(r'[、，,./\-—–\s]+', text)
+    for p in parts:
+        p = p.strip()
+        if len(p) >= 2:
+            tokens.append(p)
+    # CJK 2-gram 和 3-gram（用于部分匹配）
+    cjk_runs = re.findall(r'[\u4e00-\u9fff]+', text)
+    for run in cjk_runs:
+        for i in range(len(run) - 1):
+            tokens.append(run[i:i+2])
+        for i in range(len(run) - 2):
+            tokens.append(run[i:i+3])
+    # 英文/数字词
+    eng = re.findall(r'[a-zA-Z0-9]+', text)
+    tokens.extend(eng)
+    # 去重，按长度降序（长token匹配优先）
+    return sorted(set(tokens), key=len, reverse=True)
+
+
+def match_heading(heading: str, sections_config: list[dict]) -> tuple[str, str, str | None, str]:
+    """将个人周报的一级标题匹配到项目周报的二级标题（subsection）或大标题（section）。
+
+    匹配原则：标题中的"部分字段"（关键词token）是否被目标标题"完全匹配"（作为子串出现）。
+
+    参数:
+        heading: 个人周报一级标题（如 "同步"、"定位支持"、"Slt bug支持"）
+        sections_config: config.json 中的 sections 数组
+
+    返回:
+        (section_id, section_title, subsection_id_or_None, matched_title)
+        未匹配时 section_id 为 "?"
+    """
+    tokens = _tokenize_cjk(heading)
+
+    # 停用词列表：过于通用的词降权（得分减半）
+    STOP_WORDS = {'支持', '开发', '测试', '验证', '版本', '维护', '问题', '功能', '方案', '设计', '实现', '进行', '相关', '更新'}
+
+    # 构建目标列表: [(section_id, section_title, subsection_id_or_None, target_title), ...]
+    # 同时包含 subsection 和 section 大标题
+    targets = []
+    for sec in sections_config:
+        sid = sec['id']
+        stitle = sec['title']
+        # section 大标题（subsection_id=None 表示匹配到大节）
+        targets.append((sid, stitle, None, stitle))
+        # subsection 标题
+        for sub in sec.get('subsections', []):
+            targets.append((sid, stitle, sub['id'], sub['title']))
+
+    # 对每个 target 计算匹配得分
+    best_score = 0
+    best_match = ("?", "", None, heading)
+
+    for sid, stitle, subid, target_title in targets:
+        score = 0
+        target_lower = target_title.lower()
+        for token in tokens:
+            token_lower = token.lower()
+            if len(token) < 2:
+                continue
+
+            # 英文/数字token：要求词边界匹配，避免 "LS" 误匹配 "slss"
+            is_eng = bool(re.match(r'^[a-zA-Z0-9]+$', token) and len(token) >= 2)
+            if is_eng:
+                # 用词边界正则匹配（前后为非字母数字或字符串边界）
+                pattern = re.compile(r'(?:^|[^a-zA-Z0-9])' + re.escape(token_lower) + r'(?:$|[^a-zA-Z0-9])')
+                if not pattern.search(target_lower):
+                    continue
+
+            if token_lower in target_lower:
+                weight = len(token)
+                # 停用词降权
+                if token in STOP_WORDS:
+                    weight = max(1, weight // 2)
+                # 英文/数字token加权（更具体）
+                if is_eng:
+                    weight = weight * 2
+                score += weight
+
+        # 完整标题作为子串匹配时大幅加分
+        heading_lower = heading.lower()
+        if heading_lower in target_lower:
+            score += 10
+
+        if score > best_score:
+            best_score = score
+            if subid is None:
+                # 匹配的是 section 大标题
+                best_match = (sid, stitle, None, target_title)
+            else:
+                best_match = (sid, stitle, subid, target_title)
+
+    # 至少要有一个 >=2 字符的token命中，才算有效匹配
+    if best_score >= 2:
+        return best_match
+    else:
+        return ("?", "", None, heading)
+
+
 TAG_RE = re.compile(r'\[([^\]]+)\]')  # [标签]
 SECTION_TAG_RE = re.compile(r'\[(\d+(?:\.\d+)?)\s*[-—–\s]+([^\]]+)\]')  # [1.1 标题]
 
@@ -123,79 +538,111 @@ STRIP_NUM_RE = re.compile(
 )
 
 
-def parse_tagged_items(text: str, alias_map: dict[str, tuple[str, str, str]]) -> list[dict]:
+def parse_tagged_items(text: str, sections_config: list[dict]) -> list[dict]:
     """
-    解析文本中的带标签条目。
-    规则：
-      - 以 [标签] 开头的行标记一个新条目的开始
-      - 后续行属于该条目，直到遇到下一个 [标签] 或空行分隔
-      - 标签可以是 section alias 或 "1.1 标题" 格式
-      - 若无标签，回退到关键词匹配模式
+    解析个人周报文本：先按一级标题切分，再将每个标题块匹配到项目周报的二级标题。
+
+    新逻辑（v2）：
+      1. 用 extract_headings() 提取一级标题及内容
+      2. 用 match_heading() 将标题匹配到最相关的 subsection
+      3. 对内容行较多的块，按子编号（a/b/c 或 1/2/3）拆分为多条
+      4. 若无标题 → 回退到关键词匹配
 
     返回:
-      [{section_id, section_title, subsection_id, tag, content}, ...]
+      [{section_id, section_title, subsection_id, tag, content, lines}, ...]
     """
-    items = []
-    lines = text.split("\n")
-    current = None
+    all_items = []
 
-    for i, line in enumerate(lines):
+    # 第一步：尝试标题提取
+    heading_blocks = extract_headings(text)
+
+    if heading_blocks:
+        for block in heading_blocks:
+            heading = block['heading']
+            lines = block['lines']
+
+            # 允许空内容的标题（标题本身即内容）
+            if not lines:
+                lines = [heading]
+
+            # 将标题匹配到 subsection
+            sid, stitle, subid, matched_subtitle = match_heading(heading, sections_config)
+
+            if sid == "?":
+                # 未匹配 → section_id 保持 "?"，后续由 build_structure 归入「支持工作」
+                tag = heading
+            else:
+                tag = heading
+
+            # 如果内容行有子编号（a/b/c 或数字），拆分为独立条目
+            sub_items = _split_numbered_lines(lines)
+            if sub_items:
+                for sub_item in sub_items:
+                    all_items.append({
+                        "section_id": sid,
+                        "section_title": stitle,
+                        "subsection_id": subid,
+                        "tag": tag,
+                        "content": sub_item[0],
+                        "lines": sub_item,
+                        "matched_subtitle": matched_subtitle  # 新增字段：匹配到的二级标题
+                    })
+            else:
+                all_items.append({
+                    "section_id": sid,
+                    "section_title": stitle,
+                    "subsection_id": subid,
+                    "tag": tag,
+                    "content": lines[0] if lines else "",
+                    "lines": lines,
+                    "matched_subtitle": matched_subtitle
+                })
+
+    # 第二步：如果没有提取到标题 → 回退到旧版关键词匹配
+    if not all_items and text.strip():
+        # 构建 alias_map 用于回退
+        alias_map = build_alias_map(sections_config)
+        return _parse_keyword_items(text, alias_map)
+
+    return all_items
+
+
+def _split_numbered_lines(lines: list[str]) -> list[list[str]]:
+    """将内容行按子编号（如 a. / b. / 1. / bug1：）拆分为多个条目块。"""
+    sub_pattern = re.compile(
+        r'^\s*'
+        r'(?:'
+        r'[a-z][\.、）)]\s*'          # a.  b)
+        r'|\d+[\.、）)]\s*'            # 1.  2)
+        r'|bug\d+[：:]\s*'            # bug1：
+        r'|[①②③④⑤⑥⑦⑧⑨⑩][、．]\s*'    # ①
+        r')'
+    )
+
+    blocks = []
+    current = []
+
+    for line in lines:
         stripped = line.strip()
         if not stripped:
             if current:
-                items.append(current)
-                current = None
+                blocks.append(current)
+                current = []
             continue
-
-        # 检查行首是否有标签
-        tag_match = TAG_RE.search(stripped)
-        if tag_match and tag_match.start() <= 1:  # 行首或仅前面有空白/序号
-            # 保存前一个条目
+        if sub_pattern.match(stripped):
             if current:
-                items.append(current)
-
-            tag = tag_match.group(1).strip()
-            # 去掉标签部分，剩余为内容
-            content_start = tag_match.end()
-            rest = stripped[content_start:].strip("：: -—–").strip()
-
-            # 尝试匹配
-            key = tag.lower()
-            if key in alias_map:
-                sid, stitle, subid = alias_map[key]
-            else:
-                # 尝试 "ID 标题" 格式
-                m = SECTION_TAG_RE.match(stripped)
-                if m:
-                    key2 = m.group(1).lower()
-                    if key2 in alias_map:
-                        sid, stitle, subid = alias_map[key2]
-                    else:
-                        sid, stitle, subid = "?", "", None
-                else:
-                    sid, stitle, subid = "?", "", None
-
-            current = {
-                "section_id": sid,
-                "section_title": stitle,
-                "subsection_id": subid,
-                "tag": tag,
-                "content": rest,
-                "lines": [rest] if rest else []
-            }
+                blocks.append(current)
+            current = [stripped]
         else:
             if current:
-                if stripped:
-                    current["lines"].append(stripped)
+                current.append(stripped)
+            else:
+                current = [stripped]
 
     if current:
-        items.append(current)
+        blocks.append(current)
 
-    # 没有标签 → 回退到关键词匹配
-    if not items and text.strip():
-        return _parse_keyword_items(text, alias_map)
-
-    return items
+    return blocks if len(blocks) > 1 else []
 
 
 # ─── 无标签关键词匹配 ─────────────────────────────────────
@@ -368,16 +815,24 @@ def mark_report_for_review(report_text: str, markers: list[str]) -> str:
 def build_structure(prev_report: str | None, all_items: list[dict], people: list[dict],
                     sections: list[dict], week_label: str) -> dict:
     """
-    构建结构化数据：
-    {
-      week: "2026W18",
-      previous_report: "上周全文",
-      sections: [
-        {id, title, items: [{person, tag, content_lines}, ...]},
-        ...
-      ],
-      unmatched: [{person, content, raw}, ...]
-    }
+    构建结构化数据。
+
+    新逻辑（v2）：
+      - 未匹配项（section_id="?"）不再单独列为 unmatched，
+        而是自动归入 section 3「支持工作」作为新增子节。
+      - 每个独特的未匹配 heading 成为 section 3 下的一个子节标题。
+
+    返回:
+      {
+        week: "2026W18",
+        previous_report: "上周全文",
+        sections: [
+          {id, title, items: [{person, tag, content_lines}, ...], auto_subs: [...]},
+          ...
+        ],
+        unmatched: [],    # v2 中始终为空（已归入 section 3）
+        people: [...]
+      }
     """
     # 按 section_id 分组
     grouped: dict[str, list[dict]] = {}
@@ -390,21 +845,52 @@ def build_structure(prev_report: str | None, all_items: list[dict], people: list
         else:
             grouped.setdefault(sid, []).append(item)
 
+    # 将未匹配项按 heading(tag) 分组
+    auto_sub_groups: dict[str, list[dict]] = {}
+    for item in unmatched:
+        heading = item.get("tag", "(其他)")
+        auto_sub_groups.setdefault(heading, []).append(item)
+
     result_sections = []
     for sec in sections:
         sid = sec["id"]
         sec_items = grouped.get(sid, [])
+        auto_subs = []
+
+        # 只对 section 3「支持工作」追加自动子节
+        if sid == "3" and auto_sub_groups:
+            for heading, items in auto_sub_groups.items():
+                # 将多条合并为一条，保留每个人的贡献
+                merged_lines = []
+                for it in items:
+                    person = it.get("person", "?")
+                    content = " ".join(it.get("lines", []))
+                    if content:
+                        merged_lines.append(f"[{person}] {content}")
+                auto_subs.append({
+                    "heading": heading,
+                    "items": items,
+                    "merged_lines": merged_lines
+                })
+            # 将自动子节的内容也加入 sec_items（以特殊标记）
+            for auto_sub in auto_subs:
+                for it in auto_sub["items"]:
+                    it["section_id"] = "3"
+                    it["auto_sub_heading"] = auto_sub["heading"]
+                sec_items.extend(auto_sub["items"])
+
         result_sections.append({
             "id": sid,
             "title": sec["title"],
-            "items": sec_items
+            "items": sec_items,
+            "auto_subs": auto_subs if sid == "3" else []
         })
 
     return {
         "week": week_label,
         "previous_report": prev_report,
         "sections": result_sections,
-        "unmatched": unmatched,
+        "unmatched": [],  # v2: 不再有独立 unmatched
         "people": [p["name"] for p in people]
     }
 
@@ -435,20 +921,25 @@ def output_prompt(struct: dict, week_label: str):
     print(f"   将以下文件内容发送给 LLM 即可获得周报:\n   {out_path}")
 
 
-def output_dry_run(all_reports: dict, all_items: list[dict], alias_map: dict):
+def output_dry_run(all_reports: dict, sections_config: list[dict]):
     """仅展示解析结果"""
     for name, text in all_reports.items():
         print(f"\n{'='*60}")
         print(f"📄 {name}")
         print(f"{'='*60}")
-        items = parse_tagged_items(text, alias_map)
+        items = parse_tagged_items(text, sections_config)
         for item in items:
             sid = item['section_id']
             subid = item['subsection_id']
             tag = item['tag']
             content = "\n    ".join(item.get("lines", []))
             loc = f"[{sid}]" if subid is None else f"[{sid} → {subid}]"
-            print(f"  {loc} 标签=[{tag}]")
+            match_info = ""
+            if sid == "?":
+                match_info = " → [支持工作]"
+            elif item.get("matched_subtitle"):
+                match_info = f" → {item['matched_subtitle']}"
+            print(f"  {loc} 标题=[{tag}]{match_info}")
             print(f"    {content}")
         if not items:
             print("  (无标签条目)")
@@ -463,12 +954,21 @@ def build_prompt_text(struct: dict) -> str:
     lines.append(f"## 任务：生成 {struct['week']} 项目周报\n")
     lines.append("请根据以下资料，在**上周项目周报**的基础上，更新生成本周项目周报。\n")
     lines.append("### 要求")
-    lines.append("1. 保持项目周报的原有结构和编号")
-    lines.append("2. 每个分项下，将个人周报内容归纳汇总为项目级的进度描述")
-    lines.append("3. 对每一大项更新完成百分比（如 99%）")
-    lines.append("4. 删除已完成的条目，标记不再活跃的事项为「暂无新增」")
-    lines.append("5. 保留长期任务的标题不变")
-    lines.append("6. 语言风格与上周周报保持一致：简洁、技术性、每项以动词开头\n")
+    lines.append("1. 保持项目周报的原有结构和编号，以上周周报为模板进行更新")
+    lines.append("2. 每个分项下，将多人的同类工作归纳汇总为项目级的进度描述，**不要逐人罗列**")
+    lines.append("3. 对每一大项更新完成百分比（如 99%），根据实际进展调整\n")
+    lines.append("### 条目合并与精简规则（重要）")
+    lines.append("4. **已完成项精简**：已完成的条目保留在结构中，但只写「已完成」或「已交付」，**删除所有历史细节和过程描述**")
+    lines.append("5. **同主题合并**：多人/多条涉及同一主题时，合并为一条概括描述（以最完整/最新的那条为准），**禁止一人一条罗列**")
+    lines.append("6. **不再活跃的条目**：标记为「暂无新增」，不再重复抄写上期内容；连续多周无进展可删除")
+    lines.append("7. **版本号只保留最新**：同时出现新旧版本号时，只保留最新版本，旧版本号及旧描述去掉")
+    lines.append("8. **只保留最新进展**：同一问题的多轮跟踪，去掉旧结论和历史过程，只保留当前状态和最新处理方案")
+    lines.append("9. **会议/讨论归入相关技术子项**：如 DRX/LS/DS讨论归入低功耗，SLT讨论归入版本维护，不要单独列为「XX会议」条目\n")
+    lines.append("### 编号与归属规则")
+    lines.append("10. 条目精确归属到最相关的**子标题**下，不要笼统归到大类或创建独立子项")
+    lines.append("11. 保留长期任务的标题和编号不变")
+    lines.append("12. 语言风格：简洁、技术性、每项以动词开头（如「定位至」「完成」「支持」「发布」）")
+    lines.append("13. **自动归类子节**：本周汇总中标注「（自动归类）」的条目，在周报中作为「支持工作」下的新子节（如（5）XXX），标题使用自动归类的 heading 名称，内容归纳汇总后写入\n")
 
     lines.append("---\n")
     lines.append("## 上周项目周报（作为模板基础）\n")
@@ -483,7 +983,19 @@ def build_prompt_text(struct: dict) -> str:
     for sec in struct["sections"]:
         if sec["items"]:
             lines.append(f"\n### [{sec['id']}] {sec['title']}")
-            for item in sec["items"]:
+            # 如果有自动生成的子节，先列出
+            auto_subs = sec.get("auto_subs", [])
+            if auto_subs:
+                for auto_sub in auto_subs:
+                    lines.append(f"\n（自动归类）**{auto_sub['heading']}**：")
+                    for it in auto_sub["items"]:
+                        person = it.get("person", "?")
+                        content = "\n    ".join(it.get("lines", []))
+                        lines.append(f"  - **{person}**: {content}")
+
+            # 原有匹配项
+            regular_items = [it for it in sec["items"] if not it.get("auto_sub_heading")]
+            for item in regular_items:
                 person = item.get("person", "?")
                 content = "\n    ".join(item.get("lines", []))
                 lines.append(f"- **{person}** [{item['tag']}]: {content}")
@@ -593,6 +1105,10 @@ def main():
                         help="生成 md 时同时保存 prompt 文件")
     parser.add_argument("--review", action="store_true",
                         help="扫描上周周报中的已完成条目，标记并生成 _review.md 供审核")
+    parser.add_argument("--diff", action="store_true",
+                        help="对比本周与上周周报，列出内容未变更的条目")
+    parser.add_argument("--prune", metavar="IDS",
+                        help="删除指定条目，多个ID用逗号分隔，如 1.2.b,1.4.b,4.1")
     args = parser.parse_args()
 
     # 确定周标签
@@ -609,7 +1125,6 @@ def main():
         sys.exit(1)
 
     config = load_config(args.config)
-    alias_map = build_alias_map(config["sections"])
 
     # 读取个人周报
     all_reports = read_individual_reports(config)
@@ -619,18 +1134,25 @@ def main():
 
     print(f"👥 已读取 {len(all_reports)} 份个人周报")
 
-    # 解析带标签条目
+    # 解析：按一级标题匹配到项目周报二级标题
     all_items = []
     for name, text in all_reports.items():
-        items = parse_tagged_items(text, alias_map)
+        items = parse_tagged_items(text, config["sections"])
         for item in items:
             item["person"] = name
         all_items.extend(items)
         match_count = sum(1 for it in items if it["section_id"] != "?")
-        print(f"   {name}: {match_count}/{len(items)} 条匹配成功")
+        total = len(items)
+        print(f"   {name}: {match_count}/{total} 条匹配成功", end="")
+        if match_count < total:
+            unmatched_headings = set(
+                it["tag"] for it in items if it["section_id"] == "?"
+            )
+            print(f"  ⚠ 未匹配: {', '.join(unmatched_headings)}", end="")
+        print()
 
     if args.dry_run:
-        output_dry_run(all_reports, all_items, alias_map)
+        output_dry_run(all_reports, config["sections"])
         return
 
     # 读取上周项目周报
@@ -661,6 +1183,65 @@ def main():
                 print("✅ 未发现明显已完成条目。")
         else:
             print("⚠ 无上周周报或未配置 completion_markers，跳过扫描。")
+        return
+
+    # --diff / --prune 模式：对比与筛选（独立模式，不触发生成）
+    if args.diff or args.prune:
+        report_path = get_report_path(config, week_label)
+        new_text = None
+
+        if args.diff:
+            if not os.path.exists(report_path):
+                print(f"❌ 未找到本周周报: {report_path}")
+                print(f"   请先运行 --output md 生成本周周报")
+                sys.exit(1)
+            with open(report_path, 'r', encoding='utf-8') as f:
+                new_text = f.read()
+
+            prev_text = read_previous_report(config, week_label)
+            if not prev_text:
+                print("❌ 未找到上周周报，无法对比")
+                sys.exit(1)
+
+            new_struct = parse_report_to_structure(new_text)
+            old_struct = parse_report_to_structure(prev_text)
+            unchanged = diff_report_items(new_struct, old_struct)
+
+            if unchanged:
+                print(f"\n{'='*60}")
+                print(f"📋 与上周周报对比 — {len(unchanged)} 条内容未变更")
+                print(f"{'='*60}\n")
+                for item in unchanged:
+                    print(f"  [{item['id']}] {item['text']}")
+                print(f"\n💡 使用 --prune ID1,ID2,... 删除指定条目")
+            else:
+                print("✅ 所有条目均有更新。")
+
+        if args.prune:
+            if new_text is None:
+                if not os.path.exists(report_path):
+                    print(f"❌ 未找到本周周报: {report_path}")
+                    sys.exit(1)
+                with open(report_path, 'r', encoding='utf-8') as f:
+                    new_text = f.read()
+
+            remove_ids = set(x.strip() for x in args.prune.split(','))
+
+            # 备份原文件
+            backup_path = report_path.replace('.md', '_backup.md')
+            with open(backup_path, 'w', encoding='utf-8') as f:
+                f.write(new_text)
+
+            new_struct = parse_report_to_structure(new_text)
+            pruned = prune_report_structure(new_struct, remove_ids)
+            new_text = structure_to_markdown(pruned)
+
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write(new_text)
+
+            print(f"\n✅ 已删除 {len(remove_ids)} 个条目，更新至: {report_path}")
+            print(f"   备份保存至: {backup_path}")
+
         return
 
     # 构建结构化数据
@@ -699,3 +1280,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
